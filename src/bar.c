@@ -27,6 +27,7 @@
 #include<string.h>
 #include<assert.h>
 #include<ctype.h>
+#include <math.h>
 
 #include<wayland-server.h>
 #include<wayland-client.h>
@@ -43,6 +44,121 @@
 #include"bar.h"
 #include"types/colour_t.h"
 #include"types/box_t.h"
+
+#define MAG_MAX_SCALE 2.0f
+#define MAG_RADIUS    200.0f  // wider influence zone
+
+static void frame_callback_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    struct Lava_bar_instance *instance = data;
+    wl_callback_destroy(callback);
+    instance->frame_callback = NULL;
+
+    float speed = 0.25f;
+    bool  still_moving = false;
+
+    if (instance->cursor_x < 0) {
+           instance->mag_strength -= instance->mag_strength * speed * 2.0f;
+           if (instance->mag_strength < 0.01f) {
+               instance->mag_strength  = 0.0f;
+               instance->cursor_x_anim = -1;  /* only reset AFTER fully faded out */
+               instance->cursor_y_anim = -1;
+           } else {
+               still_moving = true;
+           }
+       } else {
+        /* Animate mag_strength toward 1. */
+        instance->mag_strength += (1.0f - instance->mag_strength) * speed * 2.0f;
+        if (instance->mag_strength > 0.99f)
+            instance->mag_strength = 1.0f;
+        else
+            still_moving = true;
+
+        /* Lerp cursor position. */
+        int32_t dx = instance->cursor_x - instance->cursor_x_anim;
+        int32_t dy = instance->cursor_y - instance->cursor_y_anim;
+        instance->cursor_x_anim += (int32_t)((float)dx * speed);
+        instance->cursor_y_anim += (int32_t)((float)dy * speed);
+        if (abs(dx) > 1 || abs(dy) > 1)
+            still_moving = true;
+    }
+
+    bar_instance_render_icon_frame(instance);
+    wl_surface_commit(instance->icon_surface);
+    wl_surface_commit(instance->bar_surface);
+
+    if (still_moving)
+        bar_instance_request_frame(instance);
+}
+
+static const struct wl_callback_listener frame_callback_listener = {
+    .done = frame_callback_done
+};
+
+void bar_instance_request_frame(struct Lava_bar_instance *instance)
+{
+    if (instance->frame_callback != NULL)
+        return; /* already scheduled */
+    instance->frame_callback = wl_surface_frame(instance->bar_surface);
+    wl_callback_add_listener(instance->frame_callback, &frame_callback_listener, instance);
+    wl_surface_commit(instance->bar_surface);
+}
+
+
+static float mag_scale_for_item(struct Lava_bar_instance *instance, struct Lava_item *item)
+{
+    /* Use anim values — mag_strength handles the enter/exit fade */
+    if (instance->cursor_x_anim < 0 || instance->mag_strength <= 0.0f)
+        return 1.0f;
+
+    struct Lava_bar_configuration *config = instance->config;
+
+    float icon_center = (float)item->ordinate + (float)config->size / 2.0f;
+
+    float cursor = (config->orientation == ORIENTATION_HORIZONTAL)
+        ? (float)instance->cursor_x_anim
+        : (float)instance->cursor_y_anim;
+
+    float dist = fabsf(cursor - icon_center);
+
+    if (dist >= MAG_RADIUS)
+        return 1.0f;
+
+    float t     = 1.0f - (dist / MAG_RADIUS);
+    float boost = (MAG_MAX_SCALE - 1.0f) * (t * t * (3.0f - 2.0f * t));
+    return 1.0f + boost * instance->mag_strength;
+}
+
+static void set_rounded_opaque_region(struct wl_surface *surface,
+    struct wl_compositor *compositor,
+    int32_t x, int32_t y,
+    int32_t width, int32_t height,
+    uradii_t *radii)
+{
+    /* Use the largest corner radius for the approximation. */
+    int32_t radius = (int32_t)radii->top_left;
+    if ((int32_t)radii->top_right    > radius) radius = (int32_t)radii->top_right;
+    if ((int32_t)radii->bottom_left  > radius) radius = (int32_t)radii->bottom_left;
+    if ((int32_t)radii->bottom_right > radius) radius = (int32_t)radii->bottom_right;
+
+    if (radius == 0) return; /* No rounding, skip entirely. */
+
+    struct wl_region *region = wl_compositor_create_region(compositor);
+
+    wl_region_add(region, x,          y + radius,        width,          height - 2 * radius);
+    wl_region_add(region, x + radius, y,                 width - 2 * radius, height);
+
+    for (int i = 0; i < radius; i++) {
+        int half_chord = (int)sqrt((double)(radius*radius - (radius-i)*(radius-i)));
+        wl_region_add(region, x + radius - half_chord,       y + i,                  half_chord, 1);
+        wl_region_add(region, x + width - radius,            y + i,                  half_chord, 1);
+        wl_region_add(region, x + radius - half_chord,       y + height - 1 - i,     half_chord, 1);
+        wl_region_add(region, x + width - radius,            y + height - 1 - i,     half_chord, 1);
+    }
+
+    wl_surface_set_opaque_region(surface, region);
+    wl_region_destroy(region);
+}
 
 /*************************
  * Bar configuration set *
@@ -314,7 +430,7 @@ done:
 		log_message(0, "ERROR: %s can not be negative.\n", conf_name_2);
 		return false;
 	}
-	
+
 	*_a = (uint32_t)a;
 	*_b = (uint32_t)b;
 	*_c = (uint32_t)c;
@@ -660,12 +776,35 @@ static void circle (cairo_t *cairo, uint32_t x, uint32_t y, uint32_t size)
 static void rounded_rectangle (cairo_t *cairo, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uradii_t *radii)
 {
 	double degrees = 3.1415927 / 180.0;
-	cairo_new_sub_path(cairo);
-	cairo_arc(cairo, x + w - radii->top_right,    y     + radii->top_right,    radii->top_right,   -90 * degrees,   0 * degrees);
-	cairo_arc(cairo, x + w - radii->bottom_right, y + h - radii->bottom_right, radii->bottom_right,  0 * degrees,  90 * degrees);
-	cairo_arc(cairo, x     + radii->bottom_left,  y + h - radii->bottom_left,  radii->bottom_left,  90 * degrees, 180 * degrees);
-	cairo_arc(cairo, x     + radii->top_left,     y     + radii->top_left,     radii->top_left,    180 * degrees, 270 * degrees);
-	cairo_close_path(cairo);
+
+	double aspect_ratio = (w > h) ? (double)h / w : (double)w / h;
+
+    // Устанавливаем минимальный коэффициент для радиусов
+    double min_scale = 0.5; // Минимальный радиус — 20% от заданного
+    double scale = min_scale + (1.0 - min_scale) * aspect_ratio;
+
+    // Масштабируем радиусы
+    double top_right = radii->top_right * scale;
+    double bottom_right = radii->bottom_right * scale;
+    double bottom_left = radii->bottom_left * scale;
+    double top_left = radii->top_left * scale;
+
+    // Ограничиваем радиусы, чтобы они не превышали половину меньшей стороны
+    double min_dim = (w < h) ? w : h;
+    top_right = (top_right > min_dim / 2) ? min_dim / 2 : top_right;
+    bottom_right = (bottom_right > min_dim / 2) ? min_dim / 2 : bottom_right;
+    bottom_left = (bottom_left > min_dim / 2) ? min_dim / 2 : bottom_left;
+    top_left = (top_left > min_dim / 2) ? min_dim / 2 : top_left;
+
+    cairo_new_sub_path(cairo);
+
+    // Рисуем прямоугольник с пропорциональными радиусами
+    cairo_arc(cairo, x + w - top_right, y + top_right, top_right, -90 * degrees, 0 * degrees);
+    cairo_arc(cairo, x + w - bottom_right, y + h - bottom_right, bottom_right, 0 * degrees, 90 * degrees);
+    cairo_arc(cairo, x + bottom_left, y + h - bottom_left, bottom_left, 90 * degrees, 180 * degrees);
+    cairo_arc(cairo, x + top_left, y + top_left, top_left, 180 * degrees, 270 * degrees);
+
+    cairo_close_path(cairo);
 }
 
 static void clear_buffer (cairo_t *cairo)
@@ -684,7 +823,6 @@ void destroy_indicator (struct Lava_item_indicator *indicator)
 	DESTROY(indicator->indicator_subsurface, wl_subsurface_destroy);
 	DESTROY(indicator->indicator_surface, wl_surface_destroy);
 
-	/* Cleanup in the parent. */
 	if ( indicator->seat != NULL )
 		indicator->seat->pointer.indicator = NULL;
 	if ( indicator->touchpoint != NULL )
@@ -693,7 +831,7 @@ void destroy_indicator (struct Lava_item_indicator *indicator)
 	finish_buffer(&indicator->indicator_buffers[0]);
 	finish_buffer(&indicator->indicator_buffers[1]);
 
-	wl_surface_commit(indicator->instance->bar_surface);
+	/* DO NOT commit bar_surface here — caller is responsible */
 	wl_list_remove(&indicator->link);
 	free(indicator);
 }
@@ -721,7 +859,7 @@ struct Lava_item_indicator *create_indicator (struct Lava_bar_instance *instance
 		goto error;
 	}
 
-	wl_subsurface_place_below(indicator->indicator_subsurface, instance->icon_surface);
+	wl_subsurface_place_above(indicator->indicator_subsurface, instance->icon_surface);
 	wl_subsurface_set_position(indicator->indicator_subsurface, 0, 0);
 
 	struct wl_region *region = wl_compositor_create_region(context.compositor);
@@ -800,37 +938,100 @@ void move_indicator (struct Lava_item_indicator *indicator, struct Lava_item *it
 void indicator_commit (struct Lava_item_indicator *indicator)
 {
 	wl_surface_commit(indicator->indicator_surface);
-	wl_surface_commit(indicator->instance->bar_surface);
+	// wl_surface_commit(indicator->instance->bar_surface);
 }
 
 /****************
  * Bar instance *
  ****************/
-static void draw_items (struct Lava_bar_instance *instance, cairo_t *cairo)
+static void draw_items(struct Lava_bar_instance *instance, cairo_t *cairo, uint32_t mag_headroom)
 {
-	struct Lava_bar_configuration *config = instance->config;
-	struct Lava_bar               *bar    = instance->bar;
+    struct Lava_bar_configuration *config = instance->config;
+    struct Lava_bar               *bar    = instance->bar;
+    uint32_t scale     = instance->output->scale;
+    uint32_t base_size = config->size * scale;
 
-	uint32_t scale = instance->output->scale;
-	uint32_t size = config->size * scale;
-	uint32_t *increment, increment_offset;
-	uint32_t x = 0, y = 0;
-	if ( config->orientation == ORIENTATION_HORIZONTAL )
-		increment = &x, increment_offset = x;
-	else
-		increment = &y, increment_offset = y;
+    /* Pass 1: collect items and compute magnified sizes. */
+    struct Lava_item *items[256];
+    float             scales[256];
+    int               count = 0;
 
-	struct Lava_item *item;
-	wl_list_for_each_reverse(item, &bar->items, link) if ( item->type == TYPE_BUTTON )
-	{
-		*increment = (item->ordinate * scale) + increment_offset;
-		if ( item->img != NULL )
-			image_t_draw_to_cairo(cairo, item->img,
-					x + config->icon_padding,
-					y + config->icon_padding,
-					size - (2 * config->icon_padding),
-					size - (2 * config->icon_padding));
-	}
+    struct Lava_item *item;
+    wl_list_for_each_reverse(item, &bar->items, link)
+        if (item->type == TYPE_BUTTON && count < 256)
+        {
+            items[count]  = item;
+            scales[count] = mag_scale_for_item(instance, item);
+            count++;
+        }
+
+    /* Pass 1.5: if total magnified width exceeds buffer, scale everyone down. */
+    float total_width = 0.0f;
+    for (int i = 0; i < count; i++)
+        total_width += (float)base_size * scales[i];
+
+    float max_width = (float)(instance->item_area_dim.w * scale);
+    /* Pass 1.5: reduce magnification proportionally to fit within bounds. */
+    float natural_total = (float)count * (float)base_size;
+    float extra_total   = total_width - natural_total;
+
+    if (total_width > max_width && extra_total > 0.0f) {
+        float allowed_extra  = max_width - natural_total;
+        if (allowed_extra < 0.0f) allowed_extra = 0.0f;
+        float shrink_factor = allowed_extra / extra_total;
+        for (int i = 0; i < count; i++)
+            scales[i] = 1.0f + (scales[i] - 1.0f) * shrink_factor;
+    }
+
+    /* Pass 2: compute positions by stacking magnified sizes. */
+    /* Pass 2a: original positions from item->ordinate (what the bar normally uses). */
+    float orig_positions[256];
+    for (int i = 0; i < count; i++)
+        orig_positions[i] = (float)(items[i]->ordinate * scale);
+
+    /* Pass 2b: magnified positions by stacking scaled sizes. */
+    float mag_positions[256];
+    float pos = 0.0f;
+    for (int i = 0; i < count; i++)
+    {
+        mag_positions[i] = pos;
+        pos += (float)base_size * scales[i];
+    }
+
+    /* Pass 2c: lerp between original and magnified based on mag_strength. */
+    float positions[256];
+    for (int i = 0; i < count; i++)
+        positions[i] = orig_positions[i] + (mag_positions[i] - orig_positions[i]) * instance->mag_strength;
+
+    /* Pass 3: draw each icon at its computed position. */
+    for (int i = 0; i < count; i++)
+    {
+        uint32_t icon_size = (uint32_t)((float)base_size * scales[i]);
+        uint32_t padding   = (uint32_t)(config->icon_padding * scale);
+
+        int32_t x, y;
+        if (config->orientation == ORIENTATION_HORIZONTAL) {
+            x = (int32_t)positions[i];
+            y = (int32_t)mag_headroom + (int32_t)base_size - (int32_t)icon_size;
+        } else {
+            x = (int32_t)base_size - (int32_t)icon_size;
+            y = (int32_t)positions[i];
+        }
+
+        if (items[i]->img != NULL)
+        {
+            int32_t draw_x    = x + (int32_t)padding;
+            int32_t draw_y    = y + (int32_t)padding;
+            int32_t draw_size = (int32_t)(icon_size - 2u * padding);
+
+            if (draw_size > 0 && draw_x + draw_size > 0 && draw_y + draw_size > 0)
+                image_t_draw_to_cairo(cairo, items[i]->img,
+                    (uint32_t)(draw_x < 0 ? 0 : draw_x),
+                    (uint32_t)(draw_y < 0 ? 0 : draw_y),
+                    (uint32_t)(draw_x < 0 ? draw_size + draw_x : draw_size),
+                    (uint32_t)draw_size);
+        }
+    }
 }
 
 /* Draw a rectangle with configurable borders and corners. */
@@ -911,31 +1112,30 @@ void draw_bar_background (cairo_t *cairo, ubox_t *_dim, udirections_t *_border, 
 	cairo_restore(cairo);
 }
 
-static void bar_instance_render_icon_frame (struct Lava_bar_instance *instance)
+void bar_instance_render_icon_frame (struct Lava_bar_instance *instance)
 {
-	struct Lava_output *output  = instance->output;
-	uint32_t            scale   = output->scale;
+    struct Lava_bar_configuration *config = instance->config;
+    struct Lava_output *output  = instance->output;
+    uint32_t            scale   = output->scale;
 
-	log_message(2, "[bar] Render icon frame: global_name=%d\n",
-			instance->output->global_name);
+    uint32_t mag_headroom = (uint32_t)((MAG_MAX_SCALE - 1.0f) * (float)config->size * (float)scale);
+    uint32_t buf_w = instance->item_area_dim.w * scale;  /* constraint keeps icons within this */
+    uint32_t buf_h = instance->item_area_dim.h * scale + mag_headroom;
 
-	/* Get new/next buffer. */
-	if (! next_buffer(&instance->current_icon_buffer, context.shm, instance->icon_buffers,
-				instance->item_area_dim.w  * scale, instance->item_area_dim.h * scale))
-		return;
+    if (! next_buffer(&instance->current_icon_buffer, context.shm,
+                instance->icon_buffers, buf_w, buf_h))
+        return;
 
-	cairo_t *cairo = instance->current_icon_buffer->cairo;
-	clear_buffer(cairo);
+    cairo_t *cairo = instance->current_icon_buffer->cairo;
+    clear_buffer(cairo);
+    cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
 
-	cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
+    if (! instance->hidden)
+        draw_items(instance, cairo, mag_headroom);
 
-	/* Draw icons. */
-	if (! instance->hidden)
-		draw_items(instance, cairo);
-
-	wl_surface_set_buffer_scale(instance->icon_surface, (int32_t)scale);
-	wl_surface_attach(instance->icon_surface, instance->current_icon_buffer->buffer, 0, 0);
-	wl_surface_damage_buffer(instance->icon_surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_set_buffer_scale(instance->icon_surface, (int32_t)scale);
+    wl_surface_attach(instance->icon_surface, instance->current_icon_buffer->buffer, 0, 0);
+    wl_surface_damage_buffer(instance->icon_surface, 0, 0, INT32_MAX, INT32_MAX);
 }
 
 static void bar_instance_render_background_frame (struct Lava_bar_instance *instance)
@@ -1118,17 +1318,18 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 
 static void bar_instance_configure_subsurface (struct Lava_bar_instance *instance)
 {
-	log_message(1, "[bar] Configuring icons: global_name=%d\n", instance->output->global_name);
+    struct Lava_bar_configuration *config = instance->config;
 
-	wl_subsurface_set_position(instance->subsurface,
-			(int32_t)instance->item_area_dim.x, (int32_t)instance->item_area_dim.y);
+    uint32_t mag_headroom = (uint32_t)((MAG_MAX_SCALE - 1.0f) * (float)config->size);
 
-	/* We do not want to receive any input events from the subsurface.
-	 * Almot everything in LavaLauncher uses the coords of the parent surface.
-	 */
-	struct wl_region *region = wl_compositor_create_region(context.compositor);
-	wl_surface_set_input_region(instance->icon_surface, region);
-	wl_region_destroy(region);
+    /* Shift subsurface up so magnified icons have room to grow above the bar. */
+    wl_subsurface_set_position(instance->subsurface,
+            (int32_t)instance->item_area_dim.x,
+            (int32_t)instance->item_area_dim.y - (int32_t)mag_headroom);
+
+    struct wl_region *region = wl_compositor_create_region(context.compositor);
+    wl_surface_set_input_region(instance->icon_surface, region);
+    wl_region_destroy(region);
 }
 
 /* Positions and dimensions for MODE_AGGRESSIVE. */
@@ -1393,6 +1594,12 @@ bool create_bar_instance (struct Lava_bar *bar, struct Lava_bar_configuration *c
 	instance->subsurface    = NULL;
 	instance->configured    = false;
 	instance->hover         = false;
+	instance->cursor_x       = -1;
+    instance->cursor_y       = -1;
+    instance->cursor_x_anim  = -1;
+    instance->cursor_y_anim  = -1;
+    instance->mag_strength = 0.0f;
+    instance->frame_callback = NULL;
 	instance->hidden        = bar_instance_should_hide(instance);
 
 	wl_list_init(&instance->indicators);
@@ -1431,6 +1638,11 @@ bool create_bar_instance (struct Lava_bar *bar, struct Lava_bar_configuration *c
 	bar_instance_configure_subsurface(instance);
 	zwlr_layer_surface_v1_add_listener(instance->layer_surface,
 			&layer_surface_listener, instance);
+	set_rounded_opaque_region(instance->bar_surface,
+        context.compositor,
+        (int32_t)instance->bar_dim.x, (int32_t)instance->bar_dim.y,
+        (int32_t)instance->bar_dim.w, (int32_t)instance->bar_dim.h,
+        &instance->config->radii);
 	wl_surface_commit(instance->icon_surface);
 	wl_surface_commit(instance->bar_surface);
 
@@ -1445,6 +1657,11 @@ void destroy_bar_instance (struct Lava_bar_instance *instance)
 	struct Lava_item_indicator *indicator, *temp;
 	wl_list_for_each_safe(indicator, temp, &instance->indicators, link)
 		destroy_indicator(indicator);
+
+	if (instance->frame_callback != NULL)    {
+        wl_callback_destroy(instance->frame_callback);
+        instance->frame_callback = NULL;
+    }
 
 	DESTROY(instance->layer_surface, zwlr_layer_surface_v1_destroy);
 	DESTROY(instance->subsurface, wl_subsurface_destroy);
@@ -1510,24 +1727,22 @@ void update_bar_instance (struct Lava_bar_instance *instance, bool need_new_dime
 /* Call this to handle all changes to a bar instance when it is entered by a pointer. */
 void bar_instance_pointer_enter (struct Lava_bar_instance *instance)
 {
-	instance->hover = true;
-	update_bar_instance(instance, false, true);
+    instance->hover = true;
+    /* Don't call update_bar_instance — frame callback drives the animation */
+    bar_instance_request_frame(instance);
 }
 
 /* Call this to handle all changes to a bar instance when it is left by a pointer. */
 void bar_instance_pointer_leave (struct Lava_bar_instance *instance)
 {
-	/* We have to check every seat before we can be sure that no pointer
-	 * hovers over the bar. Only then can we hide the bar.
-	 */
-	struct Lava_seat *seat;
-	wl_list_for_each(seat, &context.seats, link)
-		if ( seat->pointer.instance == instance )
-			return;
+    struct Lava_seat *seat;
+    wl_list_for_each(seat, &context.seats, link)
+        if ( seat->pointer.instance == instance )
+            return;
 
-
-	instance->hover = false;
-	update_bar_instance(instance, false, true);
+    instance->hover = false;
+    /* Don't call update_bar_instance — let frame callback animate out */
+    bar_instance_request_frame(instance);
 }
 
 struct Lava_bar_instance *bar_instance_from_surface (struct wl_surface *surface)
@@ -1551,4 +1766,3 @@ struct Lava_bar_instance *bar_instance_from_bar (struct Lava_bar *bar, struct La
 			return instance;
 	return NULL;
 }
-

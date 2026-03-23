@@ -144,6 +144,13 @@ struct Lava_bar_instance
 {
 	struct wl_list link;
 
+	int32_t cursor_x;
+	int32_t cursor_y;
+	int32_t  cursor_x_anim;   /* smoothed value used for rendering */
+    int32_t  cursor_y_anim;
+    float mag_strength;
+    struct wl_callback *frame_callback;
+
 	struct Lava_bar               *bar;
 	struct Lava_bar_configuration *config;
 	struct Lava_output            *output;
@@ -225,6 +232,7 @@ struct Lava_item_indicator *create_indicator (struct Lava_bar_instance *instance
 void move_indicator (struct Lava_item_indicator *indicator, struct Lava_item *item);
 void indicator_set_colour (struct Lava_item_indicator *indicator, colour_t *colour);
 void indicator_commit (struct Lava_item_indicator *indicator);
+void bar_instance_render_icon_frame (struct Lava_bar_instance *instance);
+void bar_instance_request_frame (struct Lava_bar_instance *instance);
 
 #endif
-

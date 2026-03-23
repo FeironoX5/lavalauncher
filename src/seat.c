@@ -417,6 +417,13 @@ static void pointer_handle_leave (void *data, struct wl_pointer *wl_pointer,
 
 	struct Lava_bar_instance *instance = seat->pointer.instance;
 
+	if ( instance != NULL )
+	{
+        instance->cursor_x = -1;
+        instance->cursor_y = -1;
+        bar_instance_request_frame(instance);
+	}
+
 	seat->pointer.x        = 0;
 	seat->pointer.y        = 0;
 	seat->pointer.instance = NULL;
@@ -451,46 +458,27 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
 		uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
 	struct Lava_seat *seat = (struct Lava_seat *)data;
-
 	seat->pointer.x = (uint32_t)wl_fixed_to_int(x);
 	seat->pointer.y = (uint32_t)wl_fixed_to_int(y);
 
-	/* It is enough to only update the indicator every other motion event. */
-	static bool skip = false;
-	if (skip)
-	{
-		skip = false;
+	struct Lava_bar_instance *instance = seat->pointer.instance;
+	if (instance == NULL)
 		return;
-	}
-	else
-		skip = true;
 
-	struct Lava_item *item = item_from_coords(seat->pointer.instance,
-			seat->pointer.x, seat->pointer.y);
+	instance->cursor_x = (int32_t)seat->pointer.x - (int32_t)instance->item_area_dim.x;
+    instance->cursor_y = (int32_t)seat->pointer.y - (int32_t)instance->item_area_dim.y;
 
-	if ( item == NULL || item->type != TYPE_BUTTON )
-	{
-		DESTROY(seat->pointer.indicator, destroy_indicator);
-		return;
-	}
+    /* On first entry, init anim position to current so cursor doesn't fly from 0,0
+    but mag_strength starts at 0 so icons still animate in smoothly. */
+    if (instance->cursor_x_anim < 0) {
+        instance->cursor_x_anim = instance->cursor_x;
+        instance->cursor_y_anim = instance->cursor_y;
+    }
 
-	if ( seat->pointer.indicator == NULL )
-	{
-		seat->pointer.indicator = create_indicator(seat->pointer.instance);
-		if ( seat->pointer.indicator == NULL )
-		{
-			log_message(0, "ERROR: Could not create indicator.\n");
-			return;
-		}
-		seat->pointer.indicator->seat = seat;
-
-		indicator_set_colour(seat->pointer.indicator,
-				&seat->pointer.instance->config->indicator_hover_colour);
-	}
-
-	move_indicator(seat->pointer.indicator, item);
-	indicator_commit(seat->pointer.indicator);
+    DESTROY(seat->pointer.indicator, destroy_indicator);
+    bar_instance_request_frame(instance);
 }
+
 
 static void pointer_handle_button (void *data, struct wl_pointer *wl_pointer,
 		uint32_t serial, uint32_t time, uint32_t button, uint32_t button_state)
@@ -503,18 +491,8 @@ static void pointer_handle_button (void *data, struct wl_pointer *wl_pointer,
 		return;
 	}
 
-	/* Only interact with the item if the pointer button was pressed and
-	 * released over the same item on the bar.
-	 */
 	if ( button_state == WL_POINTER_BUTTON_STATE_PRESSED )
 	{
-		if ( seat->pointer.indicator != NULL )
-		{
-			indicator_set_colour(seat->pointer.indicator,
-					&seat->pointer.instance->config->indicator_active_colour);
-			indicator_commit(seat->pointer.indicator);
-		}
-
 		log_message(1, "[input] Button pressed: x=%d y=%d\n",
 					seat->pointer.x, seat->pointer.y);
 		seat->pointer.item = item_from_coords(seat->pointer.instance,
@@ -522,13 +500,6 @@ static void pointer_handle_button (void *data, struct wl_pointer *wl_pointer,
 	}
 	else
 	{
-		if ( seat->pointer.indicator != NULL )
-		{
-			indicator_set_colour(seat->pointer.indicator,
-					&seat->pointer.instance->config->indicator_hover_colour);
-			indicator_commit(seat->pointer.indicator);
-		}
-
 		log_message(1, "[input] Button released: x=%d y=%d\n",
 					seat->pointer.x, seat->pointer.y);
 
@@ -761,4 +732,3 @@ void destroy_all_seats (void)
 	wl_list_for_each_safe(seat, temp, &context.seats, link)
 		destroy_seat(seat);
 }
-
