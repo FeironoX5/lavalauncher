@@ -166,6 +166,7 @@ struct Lava_bar_instance
 	ubox_t item_area_dim;
 
 	bool hidden, hover;
+	float slide_progress; /* 0.0 = half-hidden (off-screen), 1.0 = fully visible */
 
 	struct Lava_buffer  bar_buffers[2];
 	struct Lava_buffer *current_bar_buffer;

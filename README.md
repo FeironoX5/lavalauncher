@@ -1,3 +1,12 @@
+```
+ninja -C build
+./build/lavalauncher -c ~/.config/lavalauncher/lavalauncher.conf
+which lavalauncher
+cp ./build/lavalauncher /usr/local/bin/lavalauncher
+sudo cp ./build/lavalauncher /usr/local/bin/lavalauncher
+lavalauncher
+```
+
 # LavaLauncher
 
 <img src="https://git.sr.ht/~leon_plickat/lavalauncher/blob/master/.meta/example.jpg">
@@ -93,4 +102,3 @@ the header of the files for more information.
 ## Authors
 
 Leon Plickat <leonhenrik.plickat@stud.uni-goettingen.de>
-

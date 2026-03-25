@@ -48,6 +48,10 @@
 #define MAG_MAX_SCALE 2.0f
 #define MAG_RADIUS    200.0f  // wider influence zone
 
+/* Forward declarations needed by frame_callback_done. */
+static bool bar_instance_should_hide (struct Lava_bar_instance *instance);
+static void bar_instance_configure_layer_surface (struct Lava_bar_instance *instance);
+
 static void frame_callback_done(void *data, struct wl_callback *callback, uint32_t time)
 {
     struct Lava_bar_instance *instance = data;
@@ -81,6 +85,31 @@ static void frame_callback_done(void *data, struct wl_callback *callback, uint32
         instance->cursor_y_anim += (int32_t)((float)dy * speed);
         if (abs(dx) > 1 || abs(dy) > 1)
             still_moving = true;
+    }
+
+    /* Slide animation: smoothly move the dock in/out by animating slide_progress
+     * (0.0 = half-hidden behind screen edge, 1.0 = fully visible).
+     * We update the layer-surface margin on every frame so the compositor
+     * repositions the surface without requiring a configure round-trip.
+     */
+    bool uses_slide = (instance->config->hidden_mode != HIDDEN_MODE_NEVER);
+    if (uses_slide) {
+        /* Target is determined by hover state (and, for river-auto, by
+         * bar_instance_should_hide which already considers river occupancy). */
+        float target_slide = bar_instance_should_hide(instance) ? 0.0f : 1.0f;
+        float diff = target_slide - instance->slide_progress;
+
+        if (fabsf(diff) > 0.005f) {
+            /* Exponential ease-out: converges to target in ~10 frames at 60 fps. */
+            instance->slide_progress += diff * 0.30f;
+            still_moving = true;
+        } else if (instance->slide_progress != target_slide) {
+            instance->slide_progress = target_slide;
+        }
+
+        /* Push updated margin and input region into the pending surface state.
+         * The wl_surface_commit below will apply them atomically. */
+        bar_instance_configure_layer_surface(instance);
     }
 
     bar_instance_render_icon_frame(instance);
@@ -172,7 +201,7 @@ static void bar_config_sensible_defaults (struct Lava_bar_configuration *config)
 
 	config->size              = 60;
 	config->hidden_size       = 10;
-	config->hidden_mode       = HIDDEN_MODE_NEVER;
+	config->hidden_mode       = HIDDEN_MODE_ALWAYS;
 	config->icon_padding      = 4;
 	config->exclusive_zone    = 1;
 	config->indicator_padding = 0;
@@ -1130,7 +1159,10 @@ void bar_instance_render_icon_frame (struct Lava_bar_instance *instance)
     clear_buffer(cairo);
     cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
 
-    if (! instance->hidden)
+    /* In slide-animation mode the bar is always rendered at full size and
+     * positioned via margin, so we always draw items regardless of hidden. */
+    bool uses_slide_icons = (instance->config->hidden_mode != HIDDEN_MODE_NEVER);
+    if (uses_slide_icons || ! instance->hidden)
         draw_items(instance, cairo, mag_headroom);
 
     wl_surface_set_buffer_scale(instance->icon_surface, (int32_t)scale);
@@ -1144,11 +1176,21 @@ static void bar_instance_render_background_frame (struct Lava_bar_instance *inst
 	struct Lava_output            *output = instance->output;
 	uint32_t                       scale  = output->scale;
 
+	/* For slide animation, always allocate a full-size buffer so the bar
+	 * is rendered completely; the compositor positions it via margin. */
+	bool uses_slide_bg = (config->hidden_mode != HIDDEN_MODE_NEVER);
+
 	ubox_t *buffer_dim, *bar_dim;
-	if (instance->hidden)
-		buffer_dim = &instance->surface_hidden_dim, bar_dim = &instance->bar_hidden_dim;
-	else
-		buffer_dim = &instance->surface_dim, bar_dim = &instance->bar_dim;
+	if (uses_slide_bg) {
+		buffer_dim = &instance->surface_dim;
+		bar_dim    = &instance->bar_dim;
+	} else if (instance->hidden) {
+		buffer_dim = &instance->surface_hidden_dim;
+		bar_dim    = &instance->bar_hidden_dim;
+	} else {
+		buffer_dim = &instance->surface_dim;
+		bar_dim    = &instance->bar_dim;
+	}
 
 	log_message(2, "[bar] Render bar frame: global_name=%d\n", instance->output->global_name);
 
@@ -1162,8 +1204,9 @@ static void bar_instance_render_background_frame (struct Lava_bar_instance *inst
 
 	cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
 
-	/* Draw bar. */
-	if (! instance->hidden)
+	/* Draw bar background.  In slide mode the bar is always visible (just
+	 * partially off-screen), so we always draw regardless of hidden. */
+	if (uses_slide_bg || ! instance->hidden)
 	{
 		log_message(2, "[bar] Drawing bar background.\n");
 		draw_bar_background(cairo, bar_dim, &config->border, &config->radii,
@@ -1230,60 +1273,165 @@ static void bar_instance_configure_layer_surface (struct Lava_bar_instance *inst
 	log_message(1, "[bar] Configuring bar instance: global_name=%d\n",
 			instance->output->global_name);
 
+	/* For auto-hide modes we use the full surface dimensions and animate
+	 * position via a negative margin (slide animation).  For HIDDEN_MODE_NEVER
+	 * we keep the original resize behaviour.
+	 */
+	bool uses_slide = (config->hidden_mode != HIDDEN_MODE_NEVER);
+
 	ubox_t *buffer_dim, *bar_dim;
-	if (instance->hidden)
-		buffer_dim = &instance->surface_hidden_dim, bar_dim = &instance->bar_hidden_dim;
-	else
-		buffer_dim = &instance->surface_dim, bar_dim = &instance->bar_dim;
+	if (uses_slide) {
+		buffer_dim = &instance->surface_dim;
+		bar_dim    = &instance->bar_dim;
+	} else if (instance->hidden) {
+		buffer_dim = &instance->surface_hidden_dim;
+		bar_dim    = &instance->bar_hidden_dim;
+	} else {
+		buffer_dim = &instance->surface_dim;
+		bar_dim    = &instance->bar_dim;
+	}
 
 	zwlr_layer_surface_v1_set_size(instance->layer_surface, buffer_dim->w, buffer_dim->h);
 
 	/* Anchor the surface to the correct edge. */
 	zwlr_layer_surface_v1_set_anchor(instance->layer_surface, get_anchor(config));
 
+	/* Compute the slide offset: how many pixels of the bar are pushed
+	 * off-screen.  At slide_progress=0 exactly half the bar is hidden;
+	 * at slide_progress=1 the bar is fully visible.
+	 */
+	int32_t slide_offset = 0;
+	if (uses_slide) {
+		uint32_t bar_thick = (config->orientation == ORIENTATION_HORIZONTAL)
+			? instance->bar_dim.h
+			: instance->bar_dim.w;
+		slide_offset = (int32_t)((1.0f - instance->slide_progress)
+		               * (float)bar_thick * 0.5f);
+	}
+
+	/* Build margins, subtracting the slide offset on the anchored edge so
+	 * that the bar slides behind the screen boundary.
+	 */
+	int32_t margin_top    = (int32_t)config->margin.top;
+	int32_t margin_right  = (int32_t)config->margin.right;
+	int32_t margin_bottom = (int32_t)config->margin.bottom;
+	int32_t margin_left   = (int32_t)config->margin.left;
+
+	if (uses_slide) {
+		switch (config->position) {
+			case POSITION_BOTTOM: margin_bottom -= slide_offset; break;
+			case POSITION_TOP:    margin_top    -= slide_offset; break;
+			case POSITION_LEFT:   margin_left   -= slide_offset; break;
+			case POSITION_RIGHT:  margin_right  -= slide_offset; break;
+		}
+	}
+
 	if ( config->mode == MODE_DEFAULT )
 		zwlr_layer_surface_v1_set_margin(instance->layer_surface,
-				(int32_t)config->margin.top, (int32_t)config->margin.right,
-				(int32_t)config->margin.bottom, (int32_t)config->margin.left);
+				margin_top, margin_right, margin_bottom, margin_left);
 	else if ( config->orientation == ORIENTATION_HORIZONTAL )
 		zwlr_layer_surface_v1_set_margin(instance->layer_surface,
-				(int32_t)config->margin.top, 0,
-				(int32_t)config->margin.bottom, 0);
+				margin_top, 0, margin_bottom, 0);
 	else
 		zwlr_layer_surface_v1_set_margin(instance->layer_surface,
-				0, (int32_t)config->margin.right,
-				0, (int32_t)config->margin.left);
+				0, margin_right, 0, margin_left);
 
-	/* Set exclusive zone to prevent other surfaces from obstructing ours. */
+	/* Auto-hide bars don't reserve screen space (exclusive_zone=0) so that
+	 * other windows are not pushed away.  We avoid changing the exclusive
+	 * zone during animation to prevent compositor configure round-trips.
+	 */
 	int32_t exclusive_zone;
-	if ( config->exclusive_zone == 1 )
-	{
+	if (uses_slide) {
+		exclusive_zone = 0;
+	} else if ( config->exclusive_zone == 1 ) {
 		if ( config->orientation == ORIENTATION_HORIZONTAL )
 			exclusive_zone = (int32_t)buffer_dim->h;
 		else
 			exclusive_zone = (int32_t)buffer_dim->w;
-	}
-	else
+	} else {
 		exclusive_zone = config->exclusive_zone;
-	zwlr_layer_surface_v1_set_exclusive_zone(instance->layer_surface,
-			exclusive_zone);
+	}
+	zwlr_layer_surface_v1_set_exclusive_zone(instance->layer_surface, exclusive_zone);
 
 	if ( context.need_keyboard == true )
 		zwlr_layer_surface_v1_set_keyboard_interactivity(instance->layer_surface,
 				ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
 
-	/* Create a region of the visible part of the surface.
-	 * Behold: In MODE_AGGRESSIVE, the actual surface is larger than the visible bar.
+	/* Input region: for the slide animation only the currently visible
+	 * portion of the bar should receive pointer/touch events.
+	 *
+	 * vis_frac goes from 0.5 (half visible) to 1.0 (fully visible).
+	 *
+	 * Which part of the surface is on-screen depends on the position:
+	 *   BOTTOM → surface is pushed down, top portion is visible.
+	 *   TOP    → surface is pushed up,   bottom portion is visible.
+	 *   RIGHT  → surface is pushed right, left portion is visible.
+	 *   LEFT   → surface is pushed left,  right portion is visible.
 	 */
 	struct wl_region *region = wl_compositor_create_region(context.compositor);
-	wl_region_add(region, (int32_t)instance->bar_dim.x, (int32_t)instance->bar_dim.y,
-			(int32_t)bar_dim->w, (int32_t)bar_dim->h);
 
-	/* Set input region. This is necessary to prevent the unused parts of
-	 * the surface to catch pointer and touch events.
-	 */
+	if (uses_slide) {
+		float vis_frac = 0.5f + 0.5f * instance->slide_progress;
+		int32_t reg_x, reg_y, reg_w, reg_h;
+
+		if (config->orientation == ORIENTATION_HORIZONTAL) {
+			int32_t vis_h = (int32_t)((float)instance->bar_dim.h * vis_frac);
+			switch (config->position) {
+				case POSITION_BOTTOM:
+					/* Top of surface is visible. */
+					reg_x = (int32_t)instance->bar_dim.x;
+					reg_y = (int32_t)instance->bar_dim.y;
+					reg_w = (int32_t)bar_dim->w;
+					reg_h = vis_h;
+					break;
+				case POSITION_TOP:
+					/* Bottom of surface is visible. */
+					reg_x = (int32_t)instance->bar_dim.x;
+					reg_y = (int32_t)instance->bar_dim.h - vis_h;
+					reg_w = (int32_t)bar_dim->w;
+					reg_h = vis_h;
+					break;
+				default:
+					reg_x = (int32_t)instance->bar_dim.x;
+					reg_y = (int32_t)instance->bar_dim.y;
+					reg_w = (int32_t)bar_dim->w;
+					reg_h = (int32_t)bar_dim->h;
+					break;
+			}
+		} else {
+			int32_t vis_w = (int32_t)((float)instance->bar_dim.w * vis_frac);
+			switch (config->position) {
+				case POSITION_RIGHT:
+					/* Left of surface is visible. */
+					reg_x = (int32_t)instance->bar_dim.x;
+					reg_y = (int32_t)instance->bar_dim.y;
+					reg_w = vis_w;
+					reg_h = (int32_t)bar_dim->h;
+					break;
+				case POSITION_LEFT:
+					/* Right of surface is visible. */
+					reg_x = (int32_t)instance->bar_dim.w - vis_w;
+					reg_y = (int32_t)instance->bar_dim.y;
+					reg_w = vis_w;
+					reg_h = (int32_t)bar_dim->h;
+					break;
+				default:
+					reg_x = (int32_t)instance->bar_dim.x;
+					reg_y = (int32_t)instance->bar_dim.y;
+					reg_w = (int32_t)bar_dim->w;
+					reg_h = (int32_t)bar_dim->h;
+					break;
+			}
+		}
+		wl_region_add(region, reg_x, reg_y, reg_w, reg_h);
+	} else {
+		/* Original behaviour: input region covers the bar (or hidden bar). */
+		wl_region_add(region,
+				(int32_t)instance->bar_dim.x, (int32_t)instance->bar_dim.y,
+				(int32_t)bar_dim->w, (int32_t)bar_dim->h);
+	}
+
 	wl_surface_set_input_region(instance->bar_surface, region);
-
 	wl_region_destroy(region);
 }
 
@@ -1601,6 +1749,8 @@ bool create_bar_instance (struct Lava_bar *bar, struct Lava_bar_configuration *c
     instance->mag_strength = 0.0f;
     instance->frame_callback = NULL;
 	instance->hidden        = bar_instance_should_hide(instance);
+	/* Slide animation: start half-hidden for auto-hide modes, fully visible otherwise. */
+	instance->slide_progress = (config->hidden_mode == HIDDEN_MODE_NEVER) ? 1.0f : 0.0f;
 
 	wl_list_init(&instance->indicators);
 
@@ -1713,6 +1863,16 @@ void update_bar_instance (struct Lava_bar_instance *instance, bool need_new_dime
 	instance->hidden = bar_instance_should_hide(instance);
 	if ( only_update_on_hide_change && ( currently_hidden == instance->hidden ) )
 		return;
+
+	/* For slide-animation modes (HIDDEN_MODE_ALWAYS / HIDDEN_MODE_RIVER_AUTO),
+	 * hide-state transitions are driven by the frame callback so that the
+	 * bar slides smoothly.  Just kick off the animation and return; the
+	 * frame callback will call bar_instance_configure_layer_surface itself.
+	 */
+	if ( only_update_on_hide_change && instance->config->hidden_mode != HIDDEN_MODE_NEVER ) {
+		bar_instance_request_frame(instance);
+		return;
+	}
 
 	bar_instance_configure_subsurface(instance);
 	bar_instance_configure_layer_surface(instance);
